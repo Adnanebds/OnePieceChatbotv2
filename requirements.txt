@@ -1,0 +1,12 @@
+fastapi[all]
+uvicorn
+requests
+torch
+transformers
+sentence-transformers
+tenacity
+mwparserfromhell
+chromadb
+huggingface_hub
+accelerate
+bitsandbytes
