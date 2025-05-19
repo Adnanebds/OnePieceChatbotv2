@@ -31,7 +31,7 @@ EMBED_MODEL = "intfloat/e5-small-v2"
 
 # Hugging Face token
 # It's recommended to pass this via environment variables in production
-HF_TOKEN = os.environ.get("HF_TOKEN", "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")
+HF_TOKEN = os.environ.get("HF_TOKEN")
 
 # Key One Piece categories to crawl
 WIKI_CATEGORIES = {
