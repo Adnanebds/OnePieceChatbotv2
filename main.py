@@ -14,15 +14,14 @@ import chromadb
 from collections import deque
 from huggingface_hub import login
 
-# LangServe and FastAPI imports
 from fastapi import FastAPI
-from langserve import add_routes
-from langchain_core.runnables import RunnableLambda, RunnablePassthrough
-from langchain_core.pydantic_v1 import BaseModel, Field # Use pydantic_v1 for LangChain
-from typing import List, Tuple, Dict, Any, Union
-from langchain_core.chat_history import BaseChatMessageHistory, InMemoryChatMessageHistory
-from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
+from pydantic import BaseModel
+from typing import List, Tuple, Dict, Any
+
+# LangChain imports (for internal use only, not for API models)
+from langchain_core.chat_history import InMemoryChatMessageHistory
+from langchain_core.messages import HumanMessage, AIMessage
+
 import uvicorn
 
 # --- Configuration ---
@@ -33,15 +32,11 @@ DB_PATH = os.path.join(CACHE_DIR, "one_piece_data.db")
 CHROMA_DB_PATH = os.path.join(CACHE_DIR, "chroma_db")
 
 # Model Selection
-LLM_MODEL = "google/gemma-2-2b-it" # Ensure you have access and resources for this model
+LLM_MODEL = "google/gemma-2-2b-it"
 EMBED_MODEL = "intfloat/e5-small-v2"
 
-# Hugging Face token - It's best to set this as an environment variable
-HF_TOKEN = os.environ.get("HF_TOKEN") # Removed default token for security
-# If HF_TOKEN is None and your model is gated or private, login will fail.
-# For public models, login might not be strictly necessary but good practice.
+HF_TOKEN = os.environ.get("HF_TOKEN")
 
-# Key One Piece categories to crawl
 WIKI_CATEGORIES = {
     "Characters": ["Straw_Hat_Pirates", "Marines", "Yonko", "Seven_Warlords", "Worst_Generation"],
     "Devil_Fruits": ["Paramecia", "Zoan", "Logia"],
@@ -51,7 +46,6 @@ WIKI_CATEGORIES = {
     "Concepts": ["Haki", "Void_Century", "Ancient_Weapons", "Will_of_D"]
 }
 
-# Most important pages (prioritized)
 CRUCIAL_PAGES = [
     "Monkey_D._Luffy", "Straw_Hat_Pirates", "One_Piece_(Manga)", "Eiichiro_Oda",
     "Devil_Fruit", "Haki", "Void_Century", "Gol_D._Roger", "Marines", "Yonko",
@@ -62,13 +56,12 @@ CRUCIAL_PAGES = [
     "Marshall_D._Teach", "Blackbeard_Pirates", "Gura_Gura_no_Mi", "Yami_Yami_no_Mi"
 ]
 
-# Processing Parameters
 CHUNK_SIZE_TOKENS = 300
 CHUNK_OVERLAP = 2
 MAX_CONTEXT_CHUNKS = 10
 SIMILARITY_THRESHOLD = 0.35
 REFRESH_INTERVAL = 7 * 24 * 3600
-CONVERSATION_HISTORY_LENGTH = 6 # This will be managed by RunnableWithMessageHistory's store
+CONVERSATION_HISTORY_LENGTH = 6
 
 class OnePieceChatbot:
     def __init__(self):
@@ -95,14 +88,13 @@ class OnePieceChatbot:
         logging.info(f"Loading LLM tokenizer: {LLM_MODEL}")
         self.tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL)
         logging.info(f"Loading LLM model: {LLM_MODEL}")
-        # Ensure GPU is available if you expect good performance
         device_map = "auto" if torch.cuda.is_available() else "cpu"
         if device_map == "cpu":
             logging.warning("CUDA not available, loading LLM on CPU. This will be very slow.")
         self.model = AutoModelForCausalLM.from_pretrained(
             LLM_MODEL,
             device_map=device_map,
-            torch_dtype=torch.bfloat16 if device_map != "cpu" else torch.float32 # bfloat16 might not be supported on CPU
+            torch_dtype=torch.bfloat16 if device_map != "cpu" else torch.float32
         )
         self.generator = pipeline(
             "text-generation",
@@ -115,9 +107,6 @@ class OnePieceChatbot:
         )
         logging.info("Models loaded successfully.")
         
-        # Start background data processing
-        # For a production LangServe app, consider how this thread interacts with multiple workers if you scale.
-        # For simplicity, we'll keep it as is.
         self.data_processing_thread = threading.Thread(target=self._process_wiki_data, daemon=True)
         self.data_processing_thread.start()
 
@@ -169,13 +158,13 @@ class OnePieceChatbot:
         return text, links, category
 
     def _fetch_category_pages(self, category):
-        url = f"https://onepiece.fandom.com/api.php?action=query&list=categorymembers&cmtitle=Category:{category}&cmlimit=500&format=json" # Adjust cmlimit as needed
+        url = f"https://onepiece.fandom.com/api.php?action=query&list=categorymembers&cmtitle=Category:{category}&cmlimit=500&format=json"
         response = requests.get(url, timeout=15)
         data = response.json()
         pages = []
         if "query" in data and "categorymembers" in data["query"]:
             for member in data["query"]["categorymembers"]:
-                if "title" in member and ":" not in member["title"]: # Avoid "Category:", "File:", etc.
+                if "title" in member and ":" not in member["title"]:
                     pages.append(member["title"])
         return pages
 
@@ -192,7 +181,7 @@ class OnePieceChatbot:
                     pages = self._fetch_category_pages(category)
                     logging.info(f"Found {len(pages)} pages in category {category_type}:{category}")
                     for page in pages:
-                        if page not in self.processing_pages and page not in CRUCIAL_PAGES: # Avoid reprocessing
+                        if page not in self.processing_pages and page not in CRUCIAL_PAGES:
                             self._process_page(page)
                 except Exception as e:
                     logging.error(f"Error processing category {category}: {e}")
@@ -203,7 +192,7 @@ class OnePieceChatbot:
         while True:
             time.sleep(REFRESH_INTERVAL)
             logging.info("Starting refresh cycle...")
-            cur = self.db_conn.execute("SELECT title FROM wiki_data ORDER BY last_fetched ASC LIMIT 100") # Refresh oldest 100
+            cur = self.db_conn.execute("SELECT title FROM wiki_data ORDER BY last_fetched ASC LIMIT 100")
             pages_to_refresh = [row[0] for row in cur.fetchall()]
             for page in pages_to_refresh:
                 self._process_page(page, force_refresh=True)
@@ -219,8 +208,7 @@ class OnePieceChatbot:
                 cur = self.db_conn.execute("SELECT last_fetched FROM wiki_data WHERE title = ?", (title,))
                 result = cur.fetchone()
                 if result and (time.time() - result[0] < REFRESH_INTERVAL):
-                    # logging.info(f"Skipping {title}, recently fetched.")
-                    self.processing_pages.discard(title) # Use discard for sets
+                    self.processing_pages.discard(title)
                     return
 
             logging.info(f"Fetching and processing page: {title}")
@@ -254,7 +242,7 @@ class OnePieceChatbot:
         chunks, current_sentences = [], []
         token_count = 0
         for sentence in sentences:
-            tokens = len(self.tokenizer.tokenize(sentence)) # Use LLM tokenizer for more accurate count
+            tokens = len(self.tokenizer.tokenize(sentence))
             if token_count + tokens > CHUNK_SIZE_TOKENS and current_sentences:
                 chunks.append(" ".join(current_sentences))
                 if CHUNK_OVERLAP > 0 and len(current_sentences) > CHUNK_OVERLAP:
@@ -265,7 +253,7 @@ class OnePieceChatbot:
             current_sentences.append(sentence)
             token_count += tokens
         if current_sentences: chunks.append(" ".join(current_sentences))
-        return [chunk for chunk in chunks if len(self.tokenizer.tokenize(chunk)) > 20] # Min chunk token length
+        return [chunk for chunk in chunks if len(self.tokenizer.tokenize(chunk)) > 20]
 
     def _format_chat_history_for_prompt(self, chat_history: List[Tuple[str, str]]):
         if not chat_history: return ""
@@ -290,13 +278,11 @@ Only provide the complete question and nothing else:"""
                 return response
             except Exception as e:
                 logging.error(f"Error interpreting query: {e}")
-                return query # Fallback to original query
+                return query
         return query
 
     def _find_relevant_chunks(self, query: str, formatted_history: str):
         interpreted_query = self._interpret_query_with_history(query, formatted_history)
-        
-        # Enhanced query expansion
         if any(topic in interpreted_query.lower() for topic in ["joy boy", "nika", "luffy", "d clan", "devil fruit"]):
             if "joy boy" in interpreted_query.lower() and "nika" in interpreted_query.lower():
                 interpreted_query += " Hito Hito no Mi Model Nika Devil Fruit connection"
@@ -323,10 +309,6 @@ Only provide the complete question and nothing else:"""
         return chunks, list(set(sources)), interpreted_query
 
     def get_answer(self, question: str, chat_history_tuples: List[Tuple[str, str]]):
-        """
-        Generates an answer based on the question and conversation history.
-        This is the core logic that will be part of the LangChain Runnable.
-        """
         if not self.initial_processing_done.is_set():
             logging.warning("Initial data processing is not yet complete. RAG results might be suboptimal.")
         
@@ -348,159 +330,64 @@ IMPORTANT: Your answer must be directly useful. Do not say "Based on the context
 """
         try:
             response_full = self.generator(prompt)[0]["generated_text"]
-            # More robust answer extraction
-            answer_marker = "Start immediately with the answer." # Or any other reliable marker after your instructions
+            answer_marker = "Start immediately with the answer."
             if answer_marker in response_full:
                 answer = response_full.split(answer_marker, 1)[-1].strip()
-            else: # Fallback if marker is not found (e.g., model doesn't follow instructions perfectly)
-                # Try to remove the prompt part
-                answer = response_full.replace(prompt, "").strip() # This is a bit crude
-                # A more refined approach might be needed if the model includes preamble
-
-            # Further cleaning
+            else:
+                answer = response_full.replace(prompt, "").strip()
             answer = re.sub(r"^(Answer:|Okay, here's the answer based on the information:|Certainly, based on the provided context and your question about One Piece:)\s*", "", answer, flags=re.IGNORECASE).strip()
-
-
         except Exception as e:
             logging.error(f"Error during LLM generation: {e}")
             answer = "I encountered an issue trying to generate a response. Please try again."
 
         if sources:
             sources_str = ", ".join(list(set(sources))[:5])
-            return f"{answer}\n\nSources: {sources_str}"
-        return answer
+            return answer, list(set(sources)), sources_str
+        return answer, [], ""
 
-# --- LangServe Setup ---
+# --- FastAPI Setup ---
 
-# 1. Initialize the chatbot (this will load models and start data processing)
-# This instance will be shared across requests in a single-worker setup.
-# For multi-worker, each worker would have its own instance.
+# Initialize the chatbot (shared instance)
 chatbot_instance = OnePieceChatbot()
 
-# Wait a bit for some initial data to be processed, or for crucial pages at least.
-# For a real deployment, you might have a readiness probe.
 logging.info("Waiting for initial crucial data processing to complete (max 60s)...")
-if not chatbot_instance.initial_processing_done.wait(timeout=180): # Increased timeout
+if not chatbot_instance.initial_processing_done.wait(timeout=180):
     logging.warning("Initial data processing might still be ongoing in the background. Chatbot is starting anyway.")
 else:
     logging.info(f"Initial data processing complete. ChromaDB has {chatbot_instance.chroma_collection.count()} chunks.")
 
-
-# 2. Pydantic models for input and output
-# For LangServe's input, the chat_history should be a list of BaseMessage
+# Pydantic models for input and output
 class ChatInput(BaseModel):
     question: str
-    # When using RunnableWithMessageHistory, the 'chat_history' key receives BaseMessage objects
-    chat_history: List[BaseMessage] = Field(default_factory=list, extra={"widget_type": "chat"})
-
+    history: List[Tuple[str, str]] = []
 
 class ChatOutput(BaseModel):
     answer: str
-    # We could add sources or other metadata here if needed
+    sources: List[str] = []
 
-# 3. Store for conversation histories (in-memory for this example)
-# For production, consider using RedisChatMessageHistory or another persistent store.
-message_history_store = {}
-
-def get_session_history(session_id: str) -> BaseChatMessageHistory:
-    if session_id not in message_history_store:
-        message_history_store[session_id] = InMemoryChatMessageHistory() # Langchain's InMemoryChatMessageHistory
-    return message_history_store[session_id]
-
-# 4. Create the core LangChain Runnable
-
-def _extract_chat_history_tuples(lc_chat_history: List[BaseMessage]) -> List[Tuple[str, str]]:
-    """
-    Converts a list of LangChain BaseMessage objects into a list of (human_message, ai_message) tuples.
-    Assumes messages alternate HumanMessage, AIMessage.
-    """
-    formatted_history_tuples = []
-    user_msg_content = None
-    for msg in lc_chat_history:
-        if isinstance(msg, HumanMessage):
-            user_msg_content = msg.content
-        elif isinstance(msg, AIMessage) and user_msg_content is not None:
-            formatted_history_tuples.append((user_msg_content, msg.content))
-            user_msg_content = None # Reset for the next pair
-    return formatted_history_tuples
-
-# The chain now needs to correctly prepare inputs for chatbot_instance.get_answer
-# The input to this chain will be a dictionary with 'question' and 'chat_history' (List[BaseMessage])
-# We need to map this to the 'question' (str) and 'chat_history_tuples' (List[Tuple[str,str]])
-# expected by chatbot_instance.get_answer.
-
-# This RunnablePassthrough.assign takes the raw input from LangServe (which includes chat_history as BaseMessages)
-# and transforms it into the format expected by get_answer.
-# The 'question' is passed through, and 'chat_history_tuples' is created from 'chat_history'.
-core_logic_chain = RunnablePassthrough.assign(
-    chat_history_tuples=RunnableLambda(_extract_chat_history_tuples).with_types(
-        input_type=List[BaseMessage], # Input to this lambda is the chat_history from the main input
-        output_type=List[Tuple[str,str]]
-    )
-).assign(
-    # The 'answer' key holds the final result from the chatbot's get_answer method
-    answer=RunnableLambda(
-        lambda x: chatbot_instance.get_answer(x["question"], x["chat_history_tuples"])
-    ).with_types(input_type=Dict[str, Any], output_type=str) # The input to this lambda is a dict with 'question' and 'chat_history_tuples'
-).with_types(
-    # Explicitly set the output type of this core_logic_chain to match ChatOutput
-    # This runnable will return a dictionary like {"question": ..., "chat_history_tuples": ..., "answer": ...}
-    # We want it to directly output just the 'answer' string for the final chain.
-    output_type=str # The last assign directly produces the 'answer' string for the output_messages_key below
-)
-
-# Wrap with history management
-# The input to this chain will be a dictionary with "question" (str) and "chat_history" (List[BaseMessage])
-# The output will be the 'answer' string.
-conversational_rag_chain = RunnableWithMessageHistory(
-    core_logic_chain, # The core runnable that takes raw input and produces the answer string
-    get_session_history,    # Function to get/create session history
-    input_messages_key="question", # Key in the input dict for the user's question
-    history_messages_key="chat_history", # Key in the input dict where history (List[BaseMessage]) will be injected
-    output_messages_key="answer" # The final answer string produced by core_logic_chain is mapped to this key
-).with_types(
-    input_type=ChatInput,  # The API endpoint will expect ChatInput
-    output_type=str        # The API endpoint will return a string (the answer)
-)
-
-
-# 5. FastAPI App
 app = FastAPI(
     title="One Piece RAG Chatbot",
     version="1.0",
-    description="A RAG chatbot for One Piece encyclopedia using LangServe",
+    description="A RAG chatbot for One Piece encyclopedia using LangChain",
 )
 
-# Add the route for your conversational chain
-# This will expose endpoints like /onepiece_chat/invoke, /onepiece_chat/playground, etc.
-add_routes(
-    app,
-    conversational_rag_chain,
-    path="/onepiece_chat",
-    # Input/Output types are inferred or explicitly set by .with_types() on the chain
-    # input_type=ChatInput,  # Not needed here, as it's already on the chain
-    # output_type=ChatOutput # Not needed here, as the chain's output is directly a string which is handled by output_messages_key
-    config_keys=["session_id"] # Expose session_id for configurable history
-)
+@app.post("/chat", response_model=ChatOutput)
+def chat(input: ChatInput):
+    answer, sources, _ = chatbot_instance.get_answer(input.question, input.history)
+    return ChatOutput(answer=answer, sources=sources)
 
-# Optional: Add a root path or other utility endpoints
 @app.get("/")
-async def root():
+def root():
     return {
         "message": "Welcome to the One Piece RAG Chatbot API!",
-        "docs": "/docs",
-        "playground": "/onepiece_chat/playground/"
+        "docs": "/docs"
     }
 
 if __name__ == "__main__":
-    # Ensure HF_TOKEN is set if needed by your models
-    if not HF_TOKEN and (LLM_MODEL.startswith("google/") or LLM_MODEL.startswith("meta-llama/")): # Gemma and Llama models often require auth
+    if not HF_TOKEN and (LLM_MODEL.startswith("google/") or LLM_MODEL.startswith("meta-llama/")):
         logging.warning(
             f"HF_TOKEN is not set. Model {LLM_MODEL} might require authentication. "
             "Set the HF_TOKEN environment variable with your Hugging Face access token."
         )
-
     logging.info("Starting Uvicorn server...")
-    # Make sure the host and port are configurable for deployment
-    # For local testing:
     uvicorn.run(app, host="0.0.0.0", port=8000)
