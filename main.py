@@ -14,9 +14,16 @@ import chromadb
 from collections import deque
 from huggingface_hub import login
 
+# LangServe and FastAPI imports
 from fastapi import FastAPI
-from pydantic import BaseModel
-from fastapi.concurrency import run_in_threadpool # Import for running sync code in async app
+from langserve import add_routes
+from langchain_core.runnables import RunnableLambda, RunnablePassthrough
+from langchain_core.pydantic_v1 import BaseModel, Field # Use pydantic_v1 for LangChain
+from typing import List, Tuple, Dict, Any, Union
+from langchain_core.chat_history import BaseChatMessageHistory, InMemoryChatMessageHistory
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
+import uvicorn
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -26,12 +33,13 @@ DB_PATH = os.path.join(CACHE_DIR, "one_piece_data.db")
 CHROMA_DB_PATH = os.path.join(CACHE_DIR, "chroma_db")
 
 # Model Selection
-LLM_MODEL = "google/gemma-2-2b-it"
+LLM_MODEL = "google/gemma-2-2b-it" # Ensure you have access and resources for this model
 EMBED_MODEL = "intfloat/e5-small-v2"
 
-# Hugging Face token
-# It's recommended to pass this via environment variables in production
-HF_TOKEN = os.environ.get("HF_TOKEN")
+# Hugging Face token - It's best to set this as an environment variable
+HF_TOKEN = os.environ.get("HF_TOKEN") # Removed default token for security
+# If HF_TOKEN is None and your model is gated or private, login will fail.
+# For public models, login might not be strictly necessary but good practice.
 
 # Key One Piece categories to crawl
 WIKI_CATEGORIES = {
@@ -57,78 +65,64 @@ CRUCIAL_PAGES = [
 # Processing Parameters
 CHUNK_SIZE_TOKENS = 300
 CHUNK_OVERLAP = 2
-MAX_CONTEXT_CHUNKS = 10 # Increased from 8 to include more context
+MAX_CONTEXT_CHUNKS = 10
 SIMILARITY_THRESHOLD = 0.35
-REFRESH_INTERVAL = 7 * 24 * 3600 # Weekly refresh
-CONVERSATION_HISTORY_LENGTH = 6 # Enhanced for better context
+REFRESH_INTERVAL = 7 * 24 * 3600
+CONVERSATION_HISTORY_LENGTH = 6 # This will be managed by RunnableWithMessageHistory's store
 
 class OnePieceChatbot:
     def __init__(self):
         os.makedirs(CACHE_DIR, exist_ok=True)
 
-        # Login to Hugging Face
         if HF_TOKEN:
             try:
                 login(token=HF_TOKEN)
-                logging.info("Successfully logged into Hugging Face.")
+                logging.info("Successfully logged into Hugging Face Hub.")
             except Exception as e:
-                 logging.warning(f"Hugging Face login failed: {e}. Proceeding without explicit login.")
+                logging.error(f"Hugging Face Hub login failed: {e}. Public models may still work.")
+        else:
+            logging.warning("HF_TOKEN not set. Operations requiring authentication with Hugging Face Hub may fail.")
 
-
-        # Initialize database and vector store
         self.db_conn = self._init_db()
         self.chroma_client, self.chroma_collection = self._init_chroma()
 
-        # Initialize threading control
         self.data_lock = threading.Lock()
         self.processing_pages = set()
-        self.initial_processing_done = threading.Event() # Event to signal initial data load
+        self.initial_processing_done = threading.Event()
 
-        # Initialize models - These are memory intensive, loaded once
-        try:
-            self.embedder = SentenceTransformer(EMBED_MODEL)
-            logging.info(f"Loaded SentenceTransformer model: {EMBED_MODEL}")
-            self.tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL)
-            logging.info(f"Loaded Tokenizer: {LLM_MODEL}")
-            self.model = AutoModelForCausalLM.from_pretrained(
-                LLM_MODEL,
-                device_map="auto", # Automatically select device (GPU if available)
-                torch_dtype=torch.bfloat16 # Use bfloat16 for efficiency
-            )
-            logging.info(f"Loaded LLM Model: {LLM_MODEL}")
-
-            # Initialize text generation pipeline
-            self.generator = pipeline(
-                "text-generation",
-                model=self.model,
-                tokenizer=self.tokenizer,
-                max_new_tokens=500, # Increased from 300 to avoid cut-off answers
-                temperature=0.2,
-                do_sample=True, # Set to True to match the temperature setting
-                repetition_penalty=1.2 # Added to reduce repetition
-            )
-            logging.info("Initialized text generation pipeline.")
-
-        except Exception as e:
-            logging.error(f"Failed to load models: {e}")
-            # Depending on requirements, you might raise the exception or handle it gracefully
-            # For deployment, you might want to ensure models load or the app fails early
-            raise SystemExit("Failed to load models, exiting.") from e
-
-        # Conversation memory (per instance, this will be global for the API)
-        # A more complex app might manage history per user session
-        self.conversation_history = deque(maxlen=CONVERSATION_HISTORY_LENGTH)
-
-        # Start background data processing thread
-        logging.info("Starting background data processing thread...")
-        thread = threading.Thread(target=self._process_wiki_data, daemon=True)
-        thread.start()
-        logging.info("Background data processing thread started.")
-
+        logging.info(f"Loading embedding model: {EMBED_MODEL}")
+        self.embedder = SentenceTransformer(EMBED_MODEL)
+        logging.info(f"Loading LLM tokenizer: {LLM_MODEL}")
+        self.tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL)
+        logging.info(f"Loading LLM model: {LLM_MODEL}")
+        # Ensure GPU is available if you expect good performance
+        device_map = "auto" if torch.cuda.is_available() else "cpu"
+        if device_map == "cpu":
+            logging.warning("CUDA not available, loading LLM on CPU. This will be very slow.")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            LLM_MODEL,
+            device_map=device_map,
+            torch_dtype=torch.bfloat16 if device_map != "cpu" else torch.float32 # bfloat16 might not be supported on CPU
+        )
+        self.generator = pipeline(
+            "text-generation",
+            model=self.model,
+            tokenizer=self.tokenizer,
+            max_new_tokens=500,
+            temperature=0.2,
+            do_sample=True,
+            repetition_penalty=1.2
+        )
+        logging.info("Models loaded successfully.")
+        
+        # Start background data processing
+        # For a production LangServe app, consider how this thread interacts with multiple workers if you scale.
+        # For simplicity, we'll keep it as is.
+        self.data_processing_thread = threading.Thread(target=self._process_wiki_data, daemon=True)
+        self.data_processing_thread.start()
 
     def _init_db(self):
-        """Initialize SQLite database with optimized schema."""
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False) # check_same_thread=False is needed for FastAPI's async nature
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS wiki_data (
                 title TEXT PRIMARY KEY,
@@ -139,627 +133,374 @@ class OnePieceChatbot:
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_category ON wiki_data (category)")
-        conn.commit()
-        logging.info(f"SQLite database initialized at {DB_PATH}")
         return conn
 
     def _init_chroma(self):
-        """Initialize ChromaDB for vector storage."""
         client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-        collection_name = "one_piece_knowledge"
-        try:
-             collection = client.get_collection(name=collection_name)
-             logging.info(f"Connected to existing ChromaDB collection: {collection_name}")
-        except: # Catch exception if collection doesn't exist
-             collection = client.create_collection(
-                name=collection_name,
-                metadata={"hnsw:space": "cosine"} # Optimize for semantic similarity
-            )
-             logging.info(f"Created new ChromaDB collection: {collection_name}")
-
-        logging.info(f"ChromaDB initialized at {CHROMA_DB_PATH}")
+        collection = client.get_or_create_collection(
+            name="one_piece_knowledge",
+            metadata={"hnsw:space": "cosine"}
+        )
         return client, collection
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     def _fetch_wiki_page(self, title):
-        """Fetch a page from the One Piece wiki with improved parsing."""
-        logging.debug(f"Attempting to fetch wiki page: {title}")
         url = f"https://onepiece.fandom.com/api.php?action=parse&page={title}&format=json&prop=wikitext|categories"
-        try:
-            response = requests.get(url, timeout=15) # Increased timeout slightly
-            response.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
-            data = response.json()
-
-            if "parse" not in data:
-                 logging.warning(f"Could not parse wiki data for {title}")
-                 return None, [], None
-
-            wikitext = data["parse"]["wikitext"]["*"]
-            parsed = mwparserfromhell.parse(wikitext)
-
-            # Clean and extract text - Keep templates for now, focus on removing infoboxes/sidebars potentially
-            # A more robust parser might be needed for complex wiki pages
-            # Simple approach: remove large templates that aren't core content
-            for node in parsed.ifilter_templates():
-                 # Example: remove templates starting with 'Infobox' or 'Character Infobox'
-                 template_name = str(node.name).strip().lower()
-                 if template_name.startswith('infobox') or 'sidebar' in template_name:
-                     try:
-                         parsed.remove(node)
-                     except ValueError:
-                         pass # Node might already be removed
-
-            # Extract internal links
-            links = []
-            for link in parsed.ifilter_wikilinks():
-                link_title = str(link.title).split("#")[0].strip() # Remove section links
-                if ":" not in link_title and len(link_title) > 1 and not link_title.startswith(('File:', 'Category:', 'Template:')):
-                    links.append(link_title)
-
-            # Determine category
-            category = "Other"
-            if "categories" in data["parse"]:
-                categories = [cat["*"] for cat in data["parse"]["categories"]]
-                for cat_type, cat_list in WIKI_CATEGORIES.items():
-                    if any(cat.replace(' ', '_') in [c.replace(' ', '_') for c in categories] for cat in cat_list):
-                        category = cat_type
-                        break
-
-            text = parsed.strip_code().strip() # Strip all wiki code
-            text = re.sub(r'https?://\S+', '', text) # Remove URLs
-            text = re.sub(r'\[\[[^\]]+\]\]', '', text) # Remove any remaining links/categories in text
-            text = re.sub(r'\s+', ' ', text).strip() # Normalize all whitespace to single spaces
-            text = re.sub(r'\n{2,}', '\n\n', text) # Normalize multiple newlines to double newline
-
-            logging.debug(f"Successfully fetched and parsed {title}, category: {category}, links found: {len(links)}")
-            return text, links, category
-
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Request error fetching {title}: {e}")
-            raise # Re-raise to trigger retry
-        except Exception as e:
-            logging.error(f"Error processing wiki data for {title}: {e}")
-            return None, [], None # Return None on other errors
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        if "parse" not in data: return None, [], None
+        wikitext = data["parse"]["wikitext"]["*"]
+        parsed = mwparserfromhell.parse(wikitext)
+        for node in parsed.ifilter_templates():
+            try: parsed.remove(node)
+            except ValueError: pass
+        links = [str(link.title).split("#")[0].strip() for link in parsed.ifilter_wikilinks() if ":" not in str(link.title) and len(str(link.title).split("#")[0].strip()) > 1]
+        category = "Other"
+        if "categories" in data["parse"]:
+            categories_data = [cat["*"] for cat in data["parse"]["categories"]]
+            for cat_type, cat_list in WIKI_CATEGORIES.items():
+                if any(cat in categories_data for cat in cat_list):
+                    category = cat_type
+                    break
+        text = parsed.strip_code().strip()
+        text = re.sub(r'https?://\S+', '', text)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        return text, links, category
 
     def _fetch_category_pages(self, category):
-        """Fetch all pages in a specific category."""
-        logging.info(f"Fetching pages for category: {category}")
-        url = f"https://onepiece.fandom.com/api.php?action=query&list=categorymembers&cmtitle=Category:{category}&cmlimit=500&format=json"
-        try:
-            response = requests.get(url, timeout=20) # Increased timeout
-            response.raise_for_status()
-            data = response.json()
-
-            pages = []
-            if "query" in data and "categorymembers" in data["query"]:
-                for member in data["query"]["categorymembers"]:
-                     # Filter out specific namespaces like "File:", "Category:", etc.
-                    if member["ns"] == 0 and "title" in member:
-                         pages.append(member["title"])
-
-            logging.info(f"Found {len(pages)} pages in category {category}")
-            return pages
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Request error fetching category {category}: {e}")
-            return []
-        except Exception as e:
-            logging.error(f"Error processing category {category} members: {e}")
-            return []
-
+        url = f"https://onepiece.fandom.com/api.php?action=query&list=categorymembers&cmtitle=Category:{category}&cmlimit=500&format=json" # Adjust cmlimit as needed
+        response = requests.get(url, timeout=15)
+        data = response.json()
+        pages = []
+        if "query" in data and "categorymembers" in data["query"]:
+            for member in data["query"]["categorymembers"]:
+                if "title" in member and ":" not in member["title"]: # Avoid "Category:", "File:", etc.
+                    pages.append(member["title"])
+        return pages
 
     def _process_wiki_data(self):
-        """Process wiki pages and store in database and vector store."""
-        logging.info("Background processing: Starting data collection...")
-
-        processed_count = 0
-
-        # First process crucial pages
-        logging.info("Processing crucial pages...")
+        logging.info("Starting initial data processing for crucial pages...")
         for page in CRUCIAL_PAGES:
-             # Check if already processed recently
-             cur = self.db_conn.execute("SELECT last_fetched FROM wiki_data WHERE title = ?", (page,))
-             result = cur.fetchone()
-             if result and time.time() - result[0] < REFRESH_INTERVAL:
-                 logging.debug(f"Skipping recent crucial page: {page}")
-                 processed_count += 1
-                 continue
+            self._process_page(page)
+        logging.info("Finished processing crucial pages.")
 
-             if self._process_page(page):
-                 processed_count += 1
-
-
-        # Then fetch and process category pages
-        logging.info("Processing category pages...")
-        crawled_pages_from_categories = set()
+        logging.info("Starting data processing for categories...")
         for category_type, categories in WIKI_CATEGORIES.items():
             for category in categories:
                 try:
                     pages = self._fetch_category_pages(category)
+                    logging.info(f"Found {len(pages)} pages in category {category_type}:{category}")
                     for page in pages:
-                         # Avoid processing pages already processed or in queue from crucial list
-                         if page in CRUCIAL_PAGES: continue
-                         if page in crawled_pages_from_categories: continue
-
-                         crawled_pages_from_categories.add(page) # Track pages found in categories
-
-                         # Check if already processed recently
-                         cur = self.db_conn.execute("SELECT last_fetched FROM wiki_data WHERE title = ?", (page,))
-                         result = cur.fetchone()
-                         if result and time.time() - result[0] < REFRESH_INTERVAL:
-                             logging.debug(f"Skipping recent category page: {page}")
-                             processed_count += 1
-                             continue
-
-                         if self._process_page(page):
-                             processed_count += 1
-
-
+                        if page not in self.processing_pages and page not in CRUCIAL_PAGES: # Avoid reprocessing
+                            self._process_page(page)
                 except Exception as e:
                     logging.error(f"Error processing category {category}: {e}")
+        logging.info("Initial data processing from categories complete.")
+        self.initial_processing_done.set()
+        logging.info(f"Background process: Loaded {self.chroma_collection.count()} chunks of One Piece knowledge.")
 
-        self.initial_processing_done.set() # Signal that initial processing is complete
-        logging.info(f"Initial data processing finished. Processed {processed_count} pages.")
-        logging.info(f"Vector collection count after initial processing: {self.chroma_collection.count()}")
-
-
-        # Periodically refresh data
         while True:
             time.sleep(REFRESH_INTERVAL)
-            logging.info("Starting periodic refresh cycle...")
-
-            # Refresh data for a batch of existing pages ordered by oldest fetch time
-            cur = self.db_conn.execute("SELECT title FROM wiki_data ORDER BY last_fetched ASC LIMIT 200") # Increased batch size
+            logging.info("Starting refresh cycle...")
+            cur = self.db_conn.execute("SELECT title FROM wiki_data ORDER BY last_fetched ASC LIMIT 100") # Refresh oldest 100
             pages_to_refresh = [row[0] for row in cur.fetchall()]
-
-            logging.info(f"Refreshing {len(pages_to_refresh)} pages.")
             for page in pages_to_refresh:
-                 self._process_page(page) # This checks for recent fetch time internally
+                self._process_page(page, force_refresh=True)
+            logging.info("Refresh cycle complete.")
 
-            logging.info("Periodic refresh cycle finished.")
-
-
-    def _process_page(self, title):
-        """Process a single wiki page."""
-        with self.data_lock: # Use lock to prevent concurrent processing of the same page
-            if title in self.processing_pages:
-                logging.debug(f"Page {title} already in processing queue.")
-                return False # Indicate that processing was skipped
-            # Check if we *really* need to fetch this page again (double check under lock)
-            cur = self.db_conn.execute("SELECT last_fetched FROM wiki_data WHERE title = ?", (title,))
-            result = cur.fetchone()
-            if result and time.time() - result[0] < REFRESH_INTERVAL:
-                 logging.debug(f"Page {title} already processed recently under lock.")
-                 return False # Indicate that processing was skipped
-
+    def _process_page(self, title, force_refresh=False):
+        with self.data_lock:
+            if title in self.processing_pages: return
             self.processing_pages.add(title)
-            logging.info(f"Processing page: {title}")
 
         try:
-            # Fetch and process the page - happens outside the initial lock
+            if not force_refresh:
+                cur = self.db_conn.execute("SELECT last_fetched FROM wiki_data WHERE title = ?", (title,))
+                result = cur.fetchone()
+                if result and (time.time() - result[0] < REFRESH_INTERVAL):
+                    # logging.info(f"Skipping {title}, recently fetched.")
+                    self.processing_pages.discard(title) # Use discard for sets
+                    return
+
+            logging.info(f"Fetching and processing page: {title}")
             content, links, category = self._fetch_wiki_page(title)
             if not content:
-                logging.warning(f"No content fetched for {title}")
-                return False # Indicate failure
+                self.processing_pages.discard(title)
+                return
 
-            # Store in SQLite (requires lock)
-            with self.data_lock:
-                 self.db_conn.execute(
-                    "INSERT OR REPLACE INTO wiki_data VALUES (?, ?, ?, ?, ?)",
-                    (title, content, category, time.time(), ','.join(links))
-                 )
-                 self.db_conn.commit()
-                 logging.debug(f"Stored {title} in SQLite.")
+            self.db_conn.execute(
+                "INSERT OR REPLACE INTO wiki_data VALUES (?, ?, ?, ?, ?)",
+                (title, content, category, time.time(), ','.join(links))
+            )
+            self.db_conn.commit()
 
-            # Chunk and embed
             chunks = self._chunk_text(content, title)
             if chunks:
-                try:
-                    # ChromaDB operations can be done outside the main data_lock
-                    # but ensure ChromaDB client/collection access is thread-safe if needed,
-                    # although PersistentClient is generally safe.
-                    embeddings = self.embedder.encode(chunks, convert_to_tensor=False).tolist()
-                    ids = [f"{title}::{i}" for i in range(len(chunks))]
-                    metadatas = [{"source": title, "category": category} for _ in chunks]
-
-                    # Remove old chunks for this page before upserting new ones
-                    try:
-                        old_ids = self.chroma_collection.get(where={"source": title}, include=[])["ids"]
-                        if old_ids:
-                            self.chroma_collection.delete(ids=old_ids)
-                            logging.debug(f"Removed {len(old_ids)} old chunks for {title} from ChromaDB.")
-                    except Exception as delete_e:
-                         logging.warning(f"Could not delete old chunks for {title} from ChromaDB: {delete_e}")
-
-
-                    self.chroma_collection.upsert(
-                        ids=ids,
-                        embeddings=embeddings,
-                        documents=chunks,
-                        metadatas=metadatas
-                    )
-                    logging.info(f"Processed {title}: {len(chunks)} chunks added to ChromaDB.")
-                except Exception as chroma_e:
-                     logging.error(f"Error adding/updating chunks for {title} in ChromaDB: {chroma_e}")
-                     # Decide if you want to re-raise or just log the error
-                     return False # Indicate failure if vector store update fails
-
-            # Process linked pages if needed (can be done outside the main lock)
-            # Add linked pages to processing queue
-            if links:
-                logging.debug(f"Adding linked pages from {title} to processing queue.")
-                for link in links[:10]: # Limit to first 10 links to avoid too much sprawl
-                     # Queue the page processing, don't block here
-                     threading.Thread(target=self._process_page, args=(link,), daemon=True).start()
-
-
-            return True # Indicate success
+                embeddings = self.embedder.encode(chunks, convert_to_tensor=False).tolist()
+                ids = [f"{title}::{i}" for i in range(len(chunks))]
+                metadatas = [{"source": title, "category": category} for _ in chunks]
+                self.chroma_collection.upsert(ids=ids, embeddings=embeddings, documents=chunks, metadatas=metadatas)
+                logging.info(f"Processed and upserted {title}: {len(chunks)} chunks")
+            
 
         except Exception as e:
-            logging.error(f"Caught unexpected error during processing of {title}: {e}")
-            return False # Indicate failure
+            logging.error(f"Error processing {title}: {e}")
         finally:
-            # Ensure the page is removed from processing set even on error
-            with self.data_lock:
-                 if title in self.processing_pages:
-                    self.processing_pages.remove(title)
-                    logging.debug(f"Removed {title} from processing queue.")
-
+            self.processing_pages.discard(title)
 
     def _chunk_text(self, text, title):
-        """Split text into chunks for embedding with sentence awareness."""
-        # Use nltk for better sentence tokenization if possible, but regex is ok for a start
         sentences = re.split(r'(?<=[.!?])\s+', text)
         chunks, current_sentences = [], []
-        current_chunk_tokens = 0
-
-        # Simple check for minimal content
-        if len(sentences) < 2 and len(text.split()) < 50:
-             logging.debug(f"Page {title} is too short for chunking ({len(text.split())} words). Skipping.")
-             return []
-
-
-        for i, sentence in enumerate(sentences):
-            # Use tokenizer for token counting
-            sentence_tokens = len(self.tokenizer.encode(sentence, add_special_tokens=False))
-
-            # Check if adding the sentence would exceed chunk size OR if it's the last sentence
-            # If we add the sentence, what would the new token count be including a space?
-            # (approximate)
-            new_token_count = current_chunk_tokens + sentence_tokens + (1 if current_chunk_tokens > 0 else 0)
-
-            if new_token_count > CHUNK_SIZE_TOKENS and current_sentences:
-                # If adding sentence exceeds chunk size, save current sentences as a chunk
-                chunk_text = " ".join(current_sentences).strip()
-                if chunk_text: # Ensure chunk is not empty
-                    chunks.append(chunk_text)
-                logging.debug(f"Chunked: {len(chunk_text.split())} words, {len(self.tokenizer.encode(chunk_text, add_special_tokens=False))} tokens")
-
-                # Start new chunk with overlap
-                overlap_sentences = current_sentences[-CHUNK_OVERLAP:] if len(current_sentences) > CHUNK_OVERLAP else current_sentences
-                current_sentences = overlap_sentences
-                current_chunk_tokens = sum(len(self.tokenizer.encode(s, add_special_tokens=False)) for s in current_sentences)
-
+        token_count = 0
+        for sentence in sentences:
+            tokens = len(self.tokenizer.tokenize(sentence)) # Use LLM tokenizer for more accurate count
+            if token_count + tokens > CHUNK_SIZE_TOKENS and current_sentences:
+                chunks.append(" ".join(current_sentences))
+                if CHUNK_OVERLAP > 0 and len(current_sentences) > CHUNK_OVERLAP:
+                    current_sentences = current_sentences[-CHUNK_OVERLAP:]
+                    token_count = sum(len(self.tokenizer.tokenize(s)) for s in current_sentences)
+                else:
+                    current_sentences, token_count = [], 0
             current_sentences.append(sentence)
-            current_chunk_tokens += sentence_tokens + (1 if current_chunk_tokens > 0 else 0) # Add space token count
+            token_count += tokens
+        if current_sentences: chunks.append(" ".join(current_sentences))
+        return [chunk for chunk in chunks if len(self.tokenizer.tokenize(chunk)) > 20] # Min chunk token length
 
-        # Add the last chunk if any sentences remain
-        if current_sentences:
-            chunk_text = " ".join(current_sentences).strip()
-            if chunk_text: # Ensure chunk is not empty
-                 chunks.append(chunk_text)
-            logging.debug(f"Final Chunked: {len(chunk_text.split())} words, {len(self.tokenizer.encode(chunk_text, add_special_tokens=False))} tokens")
-
-        # Filter out chunks that are too short
-        return [chunk for chunk in chunks if len(chunk.split()) > 20]
-
-
-    def _interpret_query(self, query):
-        """Interpret and expand the query using conversation history."""
-        # Check if initial data processing is done before using history for complex interpretation
-        if not self.initial_processing_done.is_set() or len(query.split()) > 3 and not (query.lower().startswith("and ") or query.lower().startswith("what about ")):
-             # If initial data not ready, or query is already substantial, return original
-             return query
-
-        # Handle follow-up questions and vague queries using the LLM
-        logging.debug(f"Interpreting query: '{query}'")
-        try:
+    def _format_chat_history_for_prompt(self, chat_history: List[Tuple[str, str]]):
+        if not chat_history: return ""
+        history_str = "Recent conversation:\n"
+        for q, a in chat_history:
+            history_str += f"User: {q}\nAssistant: {a}\n"
+        return history_str
+    
+    def _interpret_query_with_history(self, query: str, formatted_history: str):
+        if len(query.split()) < 3 or query.lower().startswith(("and ", "what about ")):
+            if not formatted_history: return query
             prompt = f"""
 Based on this conversation history:
-{self._format_history()}
+{formatted_history}
 
-The user asked a question: "{query}"
-Please interpret this as a complete, standalone question about One Piece, incorporating context from the history if necessary. Ensure the reformulated question is clear and specific, even if the original query was vague or a follow-up.
-Only provide the complete reformulated question and nothing else.
-"""
-            # Use the generator for interpretation
-            # Set max_new_tokens low as we only expect a short question
-            interpretation_response = self.generator(
-                 prompt,
-                 max_new_tokens=50,
-                 temperature=0.5,
-                 do_sample=True,
-                 repetition_penalty=1.1
-            )[0]["generated_text"]
+The user asked a follow-up question: "{query}"
+Please interpret this as a complete, standalone question about One Piece.
+Only provide the complete question and nothing else:"""
+            try:
+                response = self.generator(prompt)[0]["generated_text"].split("Only provide the complete question and nothing else:")[-1].strip()
+                logging.info(f"Interpreted '{query}' as '{response}' using history.")
+                return response
+            except Exception as e:
+                logging.error(f"Error interpreting query: {e}")
+                return query # Fallback to original query
+        return query
 
-            # Extract the reformulated question (look for the part after the instruction)
-            # This is a bit fragile, depends on LLM output format
-            if "Only provide the complete reformulated question and nothing else:" in interpretation_response:
-                 interpreted_query = interpretation_response.split("Only provide the complete reformulated question and nothing else:")[-1].strip()
-            else:
-                 # Fallback if the LLM doesn't follow the format strictly
-                 # Try to clean up surrounding text
-                 lines = interpreted_query.split('\n')
-                 interpreted_query = lines[-1].strip() if lines else interpreted_query.strip()
+    def _find_relevant_chunks(self, query: str, formatted_history: str):
+        interpreted_query = self._interpret_query_with_history(query, formatted_history)
+        
+        # Enhanced query expansion
+        if any(topic in interpreted_query.lower() for topic in ["joy boy", "nika", "luffy", "d clan", "devil fruit"]):
+            if "joy boy" in interpreted_query.lower() and "nika" in interpreted_query.lower():
+                interpreted_query += " Hito Hito no Mi Model Nika Devil Fruit connection"
+            if "blackbeard" in interpreted_query.lower() and "devil fruit" in interpreted_query.lower():
+                interpreted_query += " multiple devil fruits Yami Yami no Mi Gura Gura no Mi"
+            if "gorosei" in interpreted_query.lower() or "im" in interpreted_query.lower():
+                interpreted_query += " Five Elders Empty Throne World Government"
 
+        query_embedding = self.embedder.encode(interpreted_query).tolist()
+        results = self.chroma_collection.query(
+            query_embeddings=[query_embedding],
+            n_results=MAX_CONTEXT_CHUNKS,
+            include=["documents", "metadatas", "distances"]
+        )
+        
+        chunks, sources = [], []
+        if results["documents"] and results["documents"][0]:
+            for i, doc in enumerate(results["documents"][0]):
+                distance = results["distances"][0][i]
+                similarity = 1 - distance
+                if similarity >= SIMILARITY_THRESHOLD:
+                    chunks.append(doc)
+                    sources.append(results["metadatas"][0][i]["source"])
+        return chunks, list(set(sources)), interpreted_query
 
-            # Basic cleaning
-            interpreted_query = interpreted_query.replace('"', '').strip()
-            logging.info(f"Interpreted '{query}' as '{interpreted_query}'")
-            return interpreted_query
-
-        except Exception as e:
-            logging.error(f"Error interpreting query '{query}': {e}. Using original query.")
-            return query # Fallback to original query on error
-
-
-    def _find_relevant_chunks(self, query):
-        """Find relevant chunks using vector similarity."""
-        # Wait briefly for initial data if not ready. Avoid long blocking.
+    def get_answer(self, question: str, chat_history_tuples: List[Tuple[str, str]]):
+        """
+        Generates an answer based on the question and conversation history.
+        This is the core logic that will be part of the LangChain Runnable.
+        """
         if not self.initial_processing_done.is_set():
-             logging.warning("Initial data processing not complete. Search results may be limited.")
-             # Give it a few seconds just in case it's almost done, but don't block indefinitely
-             self.initial_processing_done.wait(timeout=5) # Wait up to 5 seconds
+            logging.warning("Initial data processing is not yet complete. RAG results might be suboptimal.")
+        
+        formatted_history = self._format_chat_history_for_prompt(chat_history_tuples)
+        chunks, sources, interpreted_query = self._find_relevant_chunks(question, formatted_history)
 
-        interpreted_query = self._interpret_query(query)
+        prompt = f"""You are an expert on the One Piece manga and anime. Answer the following question based on the provided context and conversation history.
 
-        # Enhanced query expansion for key topics - performed *after* interpretation
-        # This adds specific keywords to the query that might help retrieve relevant documents
-        keywords_to_add = []
-        lower_query = interpreted_query.lower()
+{formatted_history}
 
-        if "joy boy" in lower_query or "nika" in lower_query:
-             keywords_to_add.extend(["Hito Hito no Mi Model Nika", "Sun God Nika"])
-        if "blackbeard" in lower_query and "devil fruit" in lower_query:
-             keywords_to_add.extend(["multiple devil fruits", "Yami Yami no Mi", "Gura Gura no Mi"])
-        if "gorosei" in lower_query or "im" in lower_query:
-             keywords_to_add.extend(["Five Elders", "Empty Throne", "World Government"])
-        if "void century" in lower_query:
-             keywords_to_add.extend(["Poneglyphs", "Ancient Kingdom", "Ohara"])
+Context information from One Piece Wiki:
+{" ".join(chunks) if chunks else "No specific context found for this query. Answer based on general One Piece knowledge."}
 
+Interpreted Question: {interpreted_query}
+Original Question: {question}
 
-        if keywords_to_add:
-            interpreted_query_with_keywords = interpreted_query + " " + " ".join(keywords_to_add)
-            logging.debug(f"Expanded query: {interpreted_query_with_keywords}")
-        else:
-            interpreted_query_with_keywords = interpreted_query
-
-
-        # Search vector database
-        try:
-            query_embedding = self.embedder.encode(interpreted_query_with_keywords).tolist()
-            results = self.chroma_collection.query(
-                query_embeddings=[query_embedding],
-                n_results=MAX_CONTEXT_CHUNKS,
-                include=["documents", "metadatas", "distances"]
-            )
-        except Exception as e:
-            logging.error(f"Error querying ChromaDB: {e}")
-            return [], [] # Return empty if search fails
-
-
-        chunks = []
-        sources = set() # Use a set to keep sources unique
-
-        if results and results["documents"]:
-             # Only include chunks above similarity threshold
-             for i, doc in enumerate(results["documents"][0]):
-                 distance = results["distances"][0][i]
-                 similarity = 1 - distance # Cosine distance is 1 - cosine similarity
-
-                 logging.debug(f"Chunk {i+1}: Source={results['metadatas'][0][i]['source']}, Distance={distance:.4f}, Similarity={similarity:.4f}")
-
-                 if similarity >= SIMILARITY_THRESHOLD:
-                     chunks.append(doc)
-                     sources.add(results["metadatas"][0][i]["source"])
-
-        logging.info(f"Found {len(chunks)} relevant chunks for query '{query}'. Sources: {list(sources)}")
-        return chunks, list(sources)
-
-
-    def _extract_entities(self, text):
-        """Extract potential One Piece entities from text."""
-        # This method isn't currently used in answer_question, but kept from original.
-        # Simple heuristic: look for capitalized words that might be names/places
-        entities = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', text)
-        # Filter out common English words and short words that aren't likely entities
-        common_words = {"The", "A", "An", "In", "On", "At", "For", "With", "And", "But", "Or", "Not", "Is", "Are", "Was", "Were"}
-        return [e for e in entities if len(e) > 3 and e not in common_words]
-
-
-    def _format_history(self):
-        """Format conversation history for the LLM prompt."""
-        if not self.conversation_history:
-            return "No recent conversation history."
-
-        history = "Recent conversation history:\n"
-        for i, (q, a) in enumerate(self.conversation_history):
-            history += f"Turn {i+1}:\nUser: {q}\nAssistant: {a}\n"
-        return history
-
-    def answer_question(self, question: str):
-        """Answer a question using retrieved context and conversation history."""
-        logging.info(f"Received question: '{question}'")
-
-        # Wait for initial data processing if not finished.
-        # This makes the first few requests potentially slower but ensures some data is loaded.
-        # Consider a proper "loading" status endpoint if this is too slow.
-        if not self.initial_processing_done.is_set():
-            logging.warning("Initial data processing not yet complete. Waiting up to 60s...")
-            if not self.initial_processing_done.wait(timeout=60):
-                logging.error("Initial data processing timed out. Cannot answer reliably.")
-                return "The knowledge base is still loading. Please try again in a few minutes."
-            else:
-                logging.info("Initial data processing finished while waiting.")
-
-
-        chunks, sources = self._find_relevant_chunks(question)
-
-        if not chunks:
-             logging.warning(f"No relevant chunks found for question: '{question}'")
-             # Add a fallback or a "I don't know" response if no context is found
-             fallback_prompt = f"""You are an expert on the One Piece manga and anime. The user asked: "{question}". However, no relevant specific information was found in your knowledge base. Provide a general, helpful answer based on your broad understanding of One Piece, or state that you don't have specific information on this topic. Do not invent facts.
-
-IMPORTANT: Start immediately with your answer."""
-             try:
-                 response = self.generator(fallback_prompt, max_new_tokens=200, temperature=0.7, do_sample=True)[0]["generated_text"].strip()
-                 # Clean up prompt instructions
-                 response = re.sub(r'^.*?IMPORTANT: Start immediately with your answer\.', '', response, flags=re.DOTALL).strip()
-                 answer = response
-                 # Add to history (can decide if you want "I don't know" in history)
-                 self.conversation_history.append((question, answer))
-                 return answer
-             except Exception as e:
-                  logging.error(f"Error generating fallback response: {e}")
-                  answer = "I couldn't find specific information about that in my knowledge base."
-                  self.conversation_history.append((question, answer))
-                  return answer
-
-
-        # Construct the prompt for the LLM
-        # Enhanced prompt with clear output instructions
-        prompt = f"""You are an expert on the One Piece manga and anime. Answer the following question based *only* on the provided context and your knowledge of One Piece lore.
-
-{self._format_history()}
-
-Context information:
-{chr(10).join(chunks)}
-
-Question: {question}
-
-Provide a detailed, accurate answer based on the context above. If the context doesn't contain enough information to fully answer, use your general One Piece knowledge but prioritize information from the context. Explain connections between characters and events clearly. Structure your answer logically.
-
-IMPORTANT: Your answer must be directly useful and not include phrases like "based on the context" or "answer the question". Start immediately with your answer. Ensure your answer is cohesive and well-formatted.
+Provide a detailed, accurate answer. If the context doesn't contain enough information, state that the context is limited but still try to provide a helpful answer based on general One Piece lore if possible. Include specific details and explain connections clearly.
+IMPORTANT: Your answer must be directly useful. Do not say "Based on the context..." or "To answer your question...". Start immediately with the answer.
 """
-
-        logging.debug(f"Sending prompt to LLM:\n{prompt}")
-
         try:
-            # Get the response from the generator pipeline
-            response = self.generator(prompt)[0]["generated_text"]
-            logging.debug(f"Raw LLM response:\n{response}")
+            response_full = self.generator(prompt)[0]["generated_text"]
+            # More robust answer extraction
+            answer_marker = "Start immediately with the answer." # Or any other reliable marker after your instructions
+            if answer_marker in response_full:
+                answer = response_full.split(answer_marker, 1)[-1].strip()
+            else: # Fallback if marker is not found (e.g., model doesn't follow instructions perfectly)
+                # Try to remove the prompt part
+                answer = response_full.replace(prompt, "").strip() # This is a bit crude
+                # A more refined approach might be needed if the model includes preamble
 
-            # Extract just the answer portion and clean it
-            # Use a pattern that matches the instruction part robustly
-            answer_match = re.search(r'IMPORTANT:.*?Start immediately with your answer\.(.*)', response, re.DOTALL)
-            if answer_match:
-                answer = answer_match.group(1).strip()
-            else:
-                # Fallback extraction if the instruction pattern is not found
-                # Attempt to find the question again and take everything after it
-                answer_parts = response.split("Question: " + question)
-                if len(answer_parts) > 1:
-                     answer = answer_parts[-1].strip()
-                else:
-                     # If still not found, take the last significant block or the whole thing
-                     logging.warning("Could not find extraction pattern, falling back to end of response.")
-                     answer = response.strip() # Or implement more sophisticated fallback logic
-
-
-            # Clean up any lingering prompt instructions or metadata accidentally generated
-            answer = re.sub(r'^(.*?)(?:IMPORTANT:|Based on this conversation history:|Context information:|Question:)', '', answer, flags=re.DOTALL | re.IGNORECASE).strip()
-            answer = re.sub(r'\s*Sources:\s*.*$', '', answer, flags=re.DOTALL) # Remove any "Sources:" line the LLM might invent
+            # Further cleaning
+            answer = re.sub(r"^(Answer:|Okay, here's the answer based on the information:|Certainly, based on the provided context and your question about One Piece:)\s*", "", answer, flags=re.IGNORECASE).strip()
 
 
         except Exception as e:
-            logging.error(f"Error generating response from LLM: {e}")
-            answer = "Sorry, I encountered an error while generating the response."
+            logging.error(f"Error during LLM generation: {e}")
+            answer = "I encountered an issue trying to generate a response. Please try again."
 
-
-        # Add to conversation history (user question and generated answer)
-        self.conversation_history.append((question, answer))
-        logging.debug(f"Added to history: Q='{question}', A='{answer[:50]}...'")
-
-        # Format response with better source attribution
         if sources:
-            # Ensure sources are clean titles, not links or complex text
-            clean_sources = [s.replace('_', ' ') for s in sources] # Simple cleaning
-            sources_list = list(clean_sources)[:5] # Limit to top 5 sources for brevity in output
-            sources_str = ", ".join(sources_list)
-            # Append sources clearly
+            sources_str = ", ".join(list(set(sources))[:5])
             return f"{answer}\n\nSources: {sources_str}"
-
         return answer
 
-# --- FastAPI Application Setup ---
+# --- LangServe Setup ---
 
-# Initialize the chatbot instance globally
-# This happens when the script is first imported/run, loading models and starting threads
-try:
-    chatbot = OnePieceChatbot()
-    logging.info("OnePieceChatbot instance created.")
-except Exception as e:
-    logging.critical(f"Failed to initialize OnePieceChatbot: {e}")
-    # In a real deployment, this might stop the container or signal an error
-    # For now, we'll let the app start but requests will likely fail
+# 1. Initialize the chatbot (this will load models and start data processing)
+# This instance will be shared across requests in a single-worker setup.
+# For multi-worker, each worker would have its own instance.
+chatbot_instance = OnePieceChatbot()
 
-app = FastAPI()
+# Wait a bit for some initial data to be processed, or for crucial pages at least.
+# For a real deployment, you might have a readiness probe.
+logging.info("Waiting for initial crucial data processing to complete (max 60s)...")
+if not chatbot_instance.initial_processing_done.wait(timeout=180): # Increased timeout
+    logging.warning("Initial data processing might still be ongoing in the background. Chatbot is starting anyway.")
+else:
+    logging.info(f"Initial data processing complete. ChromaDB has {chatbot_instance.chroma_collection.count()} chunks.")
 
-# Pydantic model for the request body
-class QuestionRequest(BaseModel):
+
+# 2. Pydantic models for input and output
+# For LangServe's input, the chat_history should be a list of BaseMessage
+class ChatInput(BaseModel):
     question: str
+    # When using RunnableWithMessageHistory, the 'chat_history' key receives BaseMessage objects
+    chat_history: List[BaseMessage] = Field(default_factory=list, extra={"widget_type": "chat"})
 
-# Root endpoint
+
+class ChatOutput(BaseModel):
+    answer: str
+    # We could add sources or other metadata here if needed
+
+# 3. Store for conversation histories (in-memory for this example)
+# For production, consider using RedisChatMessageHistory or another persistent store.
+message_history_store = {}
+
+def get_session_history(session_id: str) -> BaseChatMessageHistory:
+    if session_id not in message_history_store:
+        message_history_store[session_id] = InMemoryChatMessageHistory() # Langchain's InMemoryChatMessageHistory
+    return message_history_store[session_id]
+
+# 4. Create the core LangChain Runnable
+
+def _extract_chat_history_tuples(lc_chat_history: List[BaseMessage]) -> List[Tuple[str, str]]:
+    """
+    Converts a list of LangChain BaseMessage objects into a list of (human_message, ai_message) tuples.
+    Assumes messages alternate HumanMessage, AIMessage.
+    """
+    formatted_history_tuples = []
+    user_msg_content = None
+    for msg in lc_chat_history:
+        if isinstance(msg, HumanMessage):
+            user_msg_content = msg.content
+        elif isinstance(msg, AIMessage) and user_msg_content is not None:
+            formatted_history_tuples.append((user_msg_content, msg.content))
+            user_msg_content = None # Reset for the next pair
+    return formatted_history_tuples
+
+# The chain now needs to correctly prepare inputs for chatbot_instance.get_answer
+# The input to this chain will be a dictionary with 'question' and 'chat_history' (List[BaseMessage])
+# We need to map this to the 'question' (str) and 'chat_history_tuples' (List[Tuple[str,str]])
+# expected by chatbot_instance.get_answer.
+
+# This RunnablePassthrough.assign takes the raw input from LangServe (which includes chat_history as BaseMessages)
+# and transforms it into the format expected by get_answer.
+# The 'question' is passed through, and 'chat_history_tuples' is created from 'chat_history'.
+core_logic_chain = RunnablePassthrough.assign(
+    chat_history_tuples=RunnableLambda(_extract_chat_history_tuples).with_types(
+        input_type=List[BaseMessage], # Input to this lambda is the chat_history from the main input
+        output_type=List[Tuple[str,str]]
+    )
+).assign(
+    # The 'answer' key holds the final result from the chatbot's get_answer method
+    answer=RunnableLambda(
+        lambda x: chatbot_instance.get_answer(x["question"], x["chat_history_tuples"])
+    ).with_types(input_type=Dict[str, Any], output_type=str) # The input to this lambda is a dict with 'question' and 'chat_history_tuples'
+).with_types(
+    # Explicitly set the output type of this core_logic_chain to match ChatOutput
+    # This runnable will return a dictionary like {"question": ..., "chat_history_tuples": ..., "answer": ...}
+    # We want it to directly output just the 'answer' string for the final chain.
+    output_type=str # The last assign directly produces the 'answer' string for the output_messages_key below
+)
+
+# Wrap with history management
+# The input to this chain will be a dictionary with "question" (str) and "chat_history" (List[BaseMessage])
+# The output will be the 'answer' string.
+conversational_rag_chain = RunnableWithMessageHistory(
+    core_logic_chain, # The core runnable that takes raw input and produces the answer string
+    get_session_history,    # Function to get/create session history
+    input_messages_key="question", # Key in the input dict for the user's question
+    history_messages_key="chat_history", # Key in the input dict where history (List[BaseMessage]) will be injected
+    output_messages_key="answer" # The final answer string produced by core_logic_chain is mapped to this key
+).with_types(
+    input_type=ChatInput,  # The API endpoint will expect ChatInput
+    output_type=str        # The API endpoint will return a string (the answer)
+)
+
+
+# 5. FastAPI App
+app = FastAPI(
+    title="One Piece RAG Chatbot",
+    version="1.0",
+    description="A RAG chatbot for One Piece encyclopedia using LangServe",
+)
+
+# Add the route for your conversational chain
+# This will expose endpoints like /onepiece_chat/invoke, /onepiece_chat/playground, etc.
+add_routes(
+    app,
+    conversational_rag_chain,
+    path="/onepiece_chat",
+    # Input/Output types are inferred or explicitly set by .with_types() on the chain
+    # input_type=ChatInput,  # Not needed here, as it's already on the chain
+    # output_type=ChatOutput # Not needed here, as the chain's output is directly a string which is handled by output_messages_key
+    config_keys=["session_id"] # Expose session_id for configurable history
+)
+
+# Optional: Add a root path or other utility endpoints
 @app.get("/")
-async def read_root():
-    return {"message": "One Piece Chatbot API is running. Send a POST request to /ask with your question."}
+async def root():
+    return {
+        "message": "Welcome to the One Piece RAG Chatbot API!",
+        "docs": "/docs",
+        "playground": "/onepiece_chat/playground/"
+    }
 
-# Health check endpoint
-@app.get("/health")
-async def health_check():
-    # Add more sophisticated checks here if needed (e.g., db connection, model loaded)
-    if not hasattr(chatbot, 'generator') or chatbot.generator is None:
-         return {"status": "error", "message": "LLM model not loaded"}, 500
+if __name__ == "__main__":
+    # Ensure HF_TOKEN is set if needed by your models
+    if not HF_TOKEN and (LLM_MODEL.startswith("google/") or LLM_MODEL.startswith("meta-llama/")): # Gemma and Llama models often require auth
+        logging.warning(
+            f"HF_TOKEN is not set. Model {LLM_MODEL} might require authentication. "
+            "Set the HF_TOKEN environment variable with your Hugging Face access token."
+        )
 
-    # Check if the background thread has completed initial processing
-    if not chatbot.initial_processing_done.is_set():
-         return {"status": "warning", "message": "Initial data processing still in progress. Some answers may be limited."}, 200 # Or 503 Service Unavailable
-
-    # Optional: Check ChromaDB count to ensure it's not empty after initialization
-    try:
-         count = chatbot.chroma_collection.count()
-         if count == 0:
-             return {"status": "warning", "message": "Knowledge base is empty after initialization. Data fetching might have failed."}, 200
-         return {"status": "ok", "message": "Chatbot is ready.", "knowledge_base_size": count}, 200
-    except Exception as e:
-         logging.error(f"Health check failed during ChromaDB count: {e}")
-         return {"status": "warning", "message": f"Health check encountered an issue: {e}"}, 200
-
-
-# Endpoint to answer questions
-@app.post("/ask")
-async def ask_question_endpoint(request: QuestionRequest):
-    """
-    Submit a question about One Piece and get an answer.
-    """
-    question = request.question
-    if not question or not question.strip():
-        return {"answer": "Please provide a question."}
-
-    # Run the synchronous answer_question method in a thread pool
-    # This prevents blocking the FastAPI event loop
-    try:
-        answer = await run_in_threadpool(chatbot.answer_question, question)
-        return {"answer": answer}
-    except Exception as e:
-        logging.error(f"Error processing question '{question}': {e}")
-        return {"answer": "Sorry, an internal error occurred while processing your question."}, 500 # Return 500 status code on error
-
-# To run this application:
-# 1. Save the code as a Python file (e.g., main.py).
-# 2. Make sure you have the necessary libraries installed:
-#    pip install fastapi uvicorn transformers sentence-transformers tenacity mwparserfromhell chromadb requests sqlite3 accelerate bitsandbytes torch huggingface_hub
-#    (You might need additional dependencies for torch/accelerate based on your hardware, e.g., CUDA)
-# 3. Run from your terminal: uvicorn main:app --reload
-# For deployment, you'll typically use a production server like Gunicorn with Uvicorn workers:
-#    gunicorn -w 4 -k uvicorn.workers.UvicornWorker main:app
-# Ensure the HF_TOKEN environment variable is set in your deployment environment.
+    logging.info("Starting Uvicorn server...")
+    # Make sure the host and port are configurable for deployment
+    # For local testing:
+    uvicorn.run(app, host="0.0.0.0", port=8000)
