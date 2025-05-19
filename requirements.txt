@@ -1,5 +1,6 @@
 fastapi[all]
-uvicorn
+uvicorn # Can keep this for clarity, though included in fastapi[all]
+gunicorn # <--- Add this line
 requests
 torch
 transformers
