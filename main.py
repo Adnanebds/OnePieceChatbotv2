@@ -24,6 +24,9 @@ from langchain_core.messages import HumanMessage, AIMessage
 
 import uvicorn
 
+from dotenv import load_dotenv
+load_dotenv()
+
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
