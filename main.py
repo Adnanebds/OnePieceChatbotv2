@@ -32,7 +32,7 @@ DB_PATH = os.path.join(CACHE_DIR, "one_piece_data.db")
 CHROMA_DB_PATH = os.path.join(CACHE_DIR, "chroma_db")
 
 # Model Selection
-LLM_MODEL = "google/gemma-2-2b-it"
+LLM_MODEL = "google/gemma-3n-E4B-it-litert-preview"
 EMBED_MODEL = "intfloat/e5-small-v2"
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
