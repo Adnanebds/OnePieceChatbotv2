@@ -3,7 +3,7 @@ uvicorn # Can keep this for clarity, though included in fastapi[all]
 gunicorn # <--- Add this line
 requests
 torch
-transformers
+transformers==4.40.2
 sentence-transformers
 tenacity
 mwparserfromhell
