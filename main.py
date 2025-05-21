@@ -15,6 +15,7 @@ from collections import deque
 from huggingface_hub import login
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Tuple, Dict, Any
 
@@ -34,7 +35,6 @@ CACHE_DIR = "one_piece_cache"
 DB_PATH = os.path.join(CACHE_DIR, "one_piece_data.db")
 CHROMA_DB_PATH = os.path.join(CACHE_DIR, "chroma_db")
 
-# Model Selection
 LLM_MODEL = "Qwen/Qwen3-8B"
 EMBED_MODEL = "intfloat/e5-small-v2"
 
@@ -65,6 +65,17 @@ MAX_CONTEXT_CHUNKS = 10
 SIMILARITY_THRESHOLD = 0.35
 REFRESH_INTERVAL = 7 * 24 * 3600
 CONVERSATION_HISTORY_LENGTH = 6
+
+# --- CORS MIDDLEWARE MUST BE BEFORE ROUTES ---
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "https://your-production-domain.com"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class OnePieceChatbot:
     def __init__(self):
@@ -239,7 +250,6 @@ class OnePieceChatbot:
                 self.chroma_collection.upsert(ids=ids, embeddings=embeddings, documents=chunks, metadatas=metadatas)
                 logging.info(f"Processed and upserted {title}: {len(chunks)} chunks")
             
-
         except Exception as e:
             logging.error(f"Error processing {title}: {e}")
         finally:
@@ -338,64 +348,36 @@ IMPORTANT: Your answer must be directly useful. Do not say "Based on the context
 """
         try:
             response_full = self.generator(prompt)[0]["generated_text"]
-            answer_marker = "Start immediately with the answer."
-            if answer_marker in response_full:
-                answer = response_full.split(answer_marker, 1)[-1].strip()
-            else:
-                answer = response_full.replace(prompt, "").strip()
-            answer = re.sub(r"^(Answer:|Okay, here's the answer based on the information:|Certainly, based on the provided context and your question about One Piece:)\s*", "", answer, flags=re.IGNORECASE).strip()
+            # You may want to process response_full to remove the prompt if needed
+            answer = response_full.split("Start immediately with the answer.")[1].strip() if "Start immediately with the answer." in response_full else response_full.strip()
+            return answer, sources
         except Exception as e:
-            logging.error(f"Error during LLM generation: {e}")
-            answer = "I encountered an issue trying to generate a response. Please try again."
+            logging.error(f"Error generating answer: {e}")
+            return "Sorry, I couldn't generate an answer at this time.", []
 
-        if sources:
-            sources_str = ", ".join(list(set(sources))[:5])
-            return answer, list(set(sources)), sources_str
-        return answer, [], ""
-
-# --- FastAPI Setup ---
-
-# Initialize the chatbot (shared instance)
-chatbot_instance = OnePieceChatbot()
-
-logging.info("Waiting for initial crucial data processing to complete (max 60s)...")
-if not chatbot_instance.initial_processing_done.wait(timeout=180):
-    logging.warning("Initial data processing might still be ongoing in the background. Chatbot is starting anyway.")
-else:
-    logging.info(f"Initial data processing complete. ChromaDB has {chatbot_instance.chroma_collection.count()} chunks.")
-
-# Pydantic models for input and output
-class ChatInput(BaseModel):
+# --- API Models ---
+class ChatRequest(BaseModel):
     question: str
-    history: List[Tuple[str, str]] = []
+    history: List[List[str]]
 
-class ChatOutput(BaseModel):
+class ChatResponse(BaseModel):
     answer: str
-    sources: List[str] = []
+    sources: List[str]
 
-app = FastAPI(
-    title="One Piece RAG Chatbot",
-    version="1.0",
-    description="A RAG chatbot for One Piece encyclopedia using LangChain",
-)
+# --- Instantiate chatbot ---
+chatbot = OnePieceChatbot()
 
-@app.post("/chat", response_model=ChatOutput)
-def chat(input: ChatInput):
-    answer, sources, _ = chatbot_instance.get_answer(input.question, input.history)
-    return ChatOutput(answer=answer, sources=sources)
+# --- FastAPI Endpoints ---
+@app.post("/chat", response_model=ChatResponse)
+def chat_endpoint(req: ChatRequest):
+    chat_history_tuples = [tuple(pair) for pair in req.history]
+    answer, sources = chatbot.get_answer(req.question, chat_history_tuples)
+    return ChatResponse(answer=answer, sources=sources)
 
 @app.get("/")
 def root():
-    return {
-        "message": "Welcome to the One Piece RAG Chatbot API!",
-        "docs": "/docs"
-    }
+    return {"msg": "One Piece Chatbot API is running!"}
 
+# --- Run Uvicorn if needed ---
 if __name__ == "__main__":
-    if not HF_TOKEN and (LLM_MODEL.startswith("google/") or LLM_MODEL.startswith("meta-llama/")):
-        logging.warning(
-            f"HF_TOKEN is not set. Model {LLM_MODEL} might require authentication. "
-            "Set the HF_TOKEN environment variable with your Hugging Face access token."
-        )
-    logging.info("Starting Uvicorn server...")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
