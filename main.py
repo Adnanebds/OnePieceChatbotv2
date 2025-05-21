@@ -5,7 +5,7 @@ import sqlite3
 import threading
 import time
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline, BitsAndBytesConfig
 from sentence_transformers import SentenceTransformer
 from tenacity import retry, stop_after_attempt, wait_exponential
 import mwparserfromhell
@@ -35,7 +35,7 @@ DB_PATH = os.path.join(CACHE_DIR, "one_piece_data.db")
 CHROMA_DB_PATH = os.path.join(CACHE_DIR, "chroma_db")
 
 # Model Selection
-LLM_MODEL = "google/gemma-3n-E4B-it-litert-preview"
+LLM_MODEL = "Qwen/Qwen3-8B"
 EMBED_MODEL = "intfloat/e5-small-v2"
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
@@ -90,14 +90,19 @@ class OnePieceChatbot:
         self.embedder = SentenceTransformer(EMBED_MODEL)
         logging.info(f"Loading LLM tokenizer: {LLM_MODEL}")
         self.tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL)
-        logging.info(f"Loading LLM model: {LLM_MODEL}")
-        device_map = "auto" if torch.cuda.is_available() else "cpu"
-        if device_map == "cpu":
-            logging.warning("CUDA not available, loading LLM on CPU. This will be very slow.")
+
+        logging.info(f"Loading LLM model (4-bit quantized): {LLM_MODEL}")
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4"
+        )
         self.model = AutoModelForCausalLM.from_pretrained(
             LLM_MODEL,
-            device_map=device_map,
-            torch_dtype=torch.bfloat16 if device_map != "cpu" else torch.float32
+            device_map="auto",
+            quantization_config=bnb_config,
+            torch_dtype=torch.bfloat16
         )
         self.generator = pipeline(
             "text-generation",
@@ -108,7 +113,7 @@ class OnePieceChatbot:
             do_sample=True,
             repetition_penalty=1.2
         )
-        logging.info("Models loaded successfully.")
+        logging.info("Models loaded successfully (quantized).")
         
         self.data_processing_thread = threading.Thread(target=self._process_wiki_data, daemon=True)
         self.data_processing_thread.start()
@@ -277,7 +282,7 @@ Please interpret this as a complete, standalone question about One Piece.
 Only provide the complete question and nothing else:"""
             try:
                 response = self.generator(prompt)[0]["generated_text"].split("Only provide the complete question and nothing else:")[-1].strip()
-                logging.info(f"Interpreted '{query}' as '{response}' using history.")
+                logging.info(f"Interpreted '{query}' as '{response}' as '{response}' using history.")
                 return response
             except Exception as e:
                 logging.error(f"Error interpreting query: {e}")
