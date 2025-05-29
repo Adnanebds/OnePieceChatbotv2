@@ -24,31 +24,36 @@ export default function OnePieceChatbot() {
   }, [messages, loading]);
 
   const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!input.trim()) return;
+  e.preventDefault();
+  if (!input.trim()) return;
 
-    const newMessage = { role: "user", content: input };
-    setMessages((prev) => [...prev, newMessage]);
-    setInput("");
-    setLoading(true);
+  const newMessage = { role: "user", content: input };
+  setMessages((prev) => [...prev, newMessage]);
+  setInput("");
+  setLoading(true);
 
-    try {
-      const res = await fetch("https://apc9mq1dacoul2-8000.proxy.runpod.net/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: input }),
-      });
-      const data = await res.json();
-      setMessages((prev) => [...prev, { role: "bot", content: data.response }]);
-    } catch (err) {
-      setMessages((prev) => [
-        ...prev,
-        { role: "bot", content: "⚠️ Error: Unable to connect. Please try again." },
-      ]);
-    } finally {
-      setLoading(false);
-    }
-  };
+  try {
+    const res = await fetch("https://apc9mq1dacoul2-8000.proxy.runpod.net/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        question: input,
+        history: []
+      }),
+    });
+
+    const data = await res.json();
+    setMessages((prev) => [...prev, { role: "bot", content: data.answer }]);
+  } catch (err) {
+    setMessages((prev) => [
+      ...prev,
+      { role: "bot", content: "⚠️ Error: Unable to connect. Please try again." },
+    ]);
+  } finally {
+    setLoading(false);
+  }
+};
+
 
   const quickReplies = [
     "Who leads the Straw Hat Pirates?",

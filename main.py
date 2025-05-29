@@ -32,8 +32,9 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 CACHE_DIR = "one_piece_cache"
-DB_PATH = os.path.join(CACHE_DIR, "one_piece_data.db")
-CHROMA_DB_PATH = os.path.join(CACHE_DIR, "chroma_db")
+DB_PATH = "/workspace/one_piece_cache/one_piece_data.db"
+CHROMA_DB_PATH = "/workspace/one_piece_cache/chroma_db"
+
 
 LLM_MODEL = "Qwen/Qwen3-8B"
 EMBED_MODEL = "intfloat/e5-small-v2"
